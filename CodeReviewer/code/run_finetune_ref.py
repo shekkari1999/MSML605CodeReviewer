@@ -11,7 +11,8 @@ from itertools import cycle
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data import ConcatDataset
 from torch.utils.data.distributed import DistributedSampler
-from transformers import AdamW, get_linear_schedule_with_warmup
+from torch.optim import AdamW
+from transformers import get_linear_schedule_with_warmup
 from models import build_or_load_gen_model
 from configs import add_args, set_seed, set_dist
 from torch.nn.parallel import DistributedDataParallel as DDP
