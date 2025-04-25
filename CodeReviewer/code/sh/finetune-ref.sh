@@ -28,7 +28,14 @@
   export CLEARML_API_SECRET_KEY="OKVNC_EnDpdk5wXOLlmru07Hw4Ik_pWAwx7Dl-WUbJ5i8EXnDzX-6ka_kuEDnI8kksI"
   export CLEARML_SERVER_HOST="https://app.clearml.com"
   
-  # Use torchrun instead of torch.distributed.launch with correct data paths
+  # NCCL configuration for better multi-GPU communication
+  export NCCL_SOCKET_IFNAME=^lo,docker0
+  export NCCL_ASYNC_ERROR_HANDLING=1
+  export NCCL_DEBUG=INFO
+  export NCCL_P2P_DISABLE=1
+  export NCCL_IB_DISABLE=1
+
+  # Try with a smaller batch size to avoid GPU memory issues
   torchrun --nproc_per_node=${PER_NODE_GPU} --node_rank=${RANK} --nnodes=${NODES} --master_addr=${MASTER_HOST} --master_port=${MASTER_PORT} ../runfinetune.py  \
     --train_epochs 1 \
     --model_name_or_path microsoft/codereviewer \
@@ -37,7 +44,7 @@
     --dev_filename ../data/ref-valid.jsonl \
     --max_source_length 200 \
     --max_target_length 200 \
-    --train_batch_size 20 \
+    --train_batch_size 64 \
     --learning_rate 3e-4 \
     --gradient_accumulation_steps 3 \
     --mask_rate 0.15 \

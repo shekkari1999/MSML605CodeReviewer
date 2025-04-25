@@ -8,9 +8,9 @@ from itertools import cycle
 from configs import add_args, set_seed, set_dist
 import logging
 import torch.distributed as dist
-from clearml import Task
 from models import build_or_load_gen_model
 import time
+import datetime
 from peft import LoraConfig as LoRAConfig, get_peft_model
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
@@ -48,7 +48,13 @@ def get_loader(data_file, args, tokenizer, pool, eval = False):
     else:
         ## Shuffling is done
         sampler = DistributedSampler(dataset)
-    dataloader = DataLoader(dataset, sampler=sampler, batch_size=args.train_batch_size, num_workers=args.cpu_count, collate_fn=fn)
+    
+    # Initialize DataLoader with limited number of workers to avoid memory issues
+    # Using fewer workers, 4-8 is typically sufficient rather than using all available CPU cores
+    num_workers = min(4, args.cpu_count)
+    
+    dataloader = DataLoader(dataset, sampler=sampler, batch_size=args.train_batch_size, 
+                           num_workers=num_workers, collate_fn=fn)
     return dataset, sampler, dataloader
     
 #### If the above function is called, it returns the tokenized dataset
@@ -169,8 +175,25 @@ def main(args):
                    torch.distributed.get_world_size(), \
                    args.train_batch_size)
     
+    # Initialize ClearML only on the main process
+    task = None
+    if args.global_rank == 0:
+        try:
+            from clearml import Task
+            task = Task.init(project_name="AI Powered CodeReviewer", task_name="Distributed Training")
+            # Log configuration parameters
+            task.connect_configuration(vars(args))
+            logger.info("ClearML initialized successfully on main process")
+        except Exception as e:
+            logger.warning(f"ClearML could not be initialized: {str(e)}")
+            task = None
+    
+    # Add small delay to stagger process initialization
+    time.sleep(args.global_rank * 0.5)
+    
     #### we gotta let each process work with their own GPUs.
     torch.cuda.set_device(local_rank)
+    # Set seed early for consistent initialization
     set_seed(args)
 
     ## To track how much time it took to load the model 
@@ -189,25 +212,26 @@ def main(args):
     #### Here we can include some clearML task which would track model 
     ### Architecture information
 
-    task.connect_configuration({
-        'model_config': config.to_dict(),
-        'model_type': args.model_type
-            })
+    if task:
+        task.connect_configuration({
+            'model_config': config.to_dict(),
+            'model_type': args.model_type
+                })
 
-    ### log some hardware configurations
+        ### log some hardware configurations
 
-    # Log GPU/hardware info
-    task.connect_configuration({
-        "num_gpus_total": args.world_size,
-        "num_nodes": args.world_size // args.gpu_per_node,
-        "gpus_per_node": args.gpu_per_node
-    })
+        # Log GPU/hardware info
+        task.connect_configuration({
+            "num_gpus_total": args.world_size,
+            "num_nodes": args.world_size // args.gpu_per_node,
+            "gpus_per_node": args.gpu_per_node
+        })
 
-    # After model initialization
-    task.logger.report_scalar(
-        "initialization", "model_load_time_seconds", 
-        value=(end_time - start_time), iteration=0
-    )
+        # After model initialization
+        task.logger.report_scalar(
+            "initialization", "model_load_time_seconds", 
+            value=(end_time - start_time), iteration=0
+        )
 
     #### Lets Add some LoRA parameters to our model
 
@@ -227,25 +251,35 @@ def main(args):
 
     ### Add this to our ClearML , so that we can track it for different runs
 
-    # After applying LoRA
-    task.connect_configuration({
-        "lora_config": {
-            "r": lora_cfg.r,
-            "lora_alpha": lora_cfg.lora_alpha,
-            "target_modules": lora_cfg.target_modules,
-            "lora_dropout": lora_cfg.lora_dropout,
-            "trainable_params": sum(p.numel() for p in model.parameters() if p.requires_grad),
-            "total_params": sum(p.numel() for p in model.parameters()),
-            "trainable_percentage": 100 * sum(p.numel() for p in model.parameters() if p.requires_grad) / 
-                                    sum(p.numel() for p in model.parameters())
-        }
-    })
+    if task:
+        # After applying LoRA
+        task.connect_configuration({
+            "lora_config": {
+                "r": lora_cfg.r,
+                "lora_alpha": lora_cfg.lora_alpha,
+                "target_modules": lora_cfg.target_modules,
+                "lora_dropout": lora_cfg.lora_dropout,
+                "trainable_params": sum(p.numel() for p in model.parameters() if p.requires_grad),
+                "total_params": sum(p.numel() for p in model.parameters()),
+                "trainable_percentage": 100 * sum(p.numel() for p in model.parameters() if p.requires_grad) / 
+                                        sum(p.numel() for p in model.parameters())
+            }
+        })
     ## some logging info again
     logger.info("LoRA params: %d trainable / %d total",
                 sum(p.numel() for p in model.parameters() if p.requires_grad),
                 sum(p.numel() for p in model.parameters()))
 
     #### Now its time to wrap up our model in DDP
+
+    # Add logging and barrier before DDP initialization
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"[Rank {args.global_rank}] Before DDP: Total Params={total_params}, Trainable Params={trainable_params}")
+    
+    # Ensure all processes are synchronized before initializing DDP
+    # Simple barrier without timeout (compatible with older PyTorch versions)
+    dist.barrier()
 
     model = DDP(model.cuda(), device_ids = [local_rank],
                  output_device = local_rank, find_unused_parameters = True)
@@ -273,21 +307,22 @@ def main(args):
                 map_location="cpu",
             )
         )
-    scheduler.load_state_dict(
-        torch.load(
-            "{}/checkpoints-last/scheduler.pt".format(args.output_dir),
-            map_location="cpu",
-        )
-    )
-
-    # Track checkpoint loading 
-    task.logger.report_text("Resuming from checkpoint: {}/checkpoints-last/".format(args.output_dir))
-    
-    # log the current training step if available
-    if hasattr(scheduler, "last_epoch"):
-        task.logger.report_scalar("training", "resumed_from_step", 
-                                 value=scheduler.last_epoch, iteration=0)
-
+        # Move scheduler loading inside the if block to prevent errors if file doesn't exist
+        if os.path.exists("{}/checkpoints-last/scheduler.pt".format(args.output_dir)):
+            scheduler.load_state_dict(
+                torch.load(
+                    "{}/checkpoints-last/scheduler.pt".format(args.output_dir),
+                    map_location="cpu",
+                )
+            )
+            # Track checkpoint loading 
+            if task and args.global_rank == 0:
+                task.logger.report_text("Resuming from checkpoint: {}/checkpoints-last/".format(args.output_dir))
+                
+                # log the current training step if available
+                if hasattr(scheduler, "last_epoch"):
+                    task.logger.report_scalar("training", "resumed_from_step", 
+                                            value=scheduler.last_epoch, iteration=0)
     
     ##### Till here model part is finished.######
 
@@ -310,6 +345,9 @@ def main(args):
     _, _, valid_dataloader = data_tuple
 
     ### Now since everything is loaded, we will add to see how output is looking before training
+    # Add barrier before sample generation to ensure all processes are in sync
+    dist.barrier()
+    
     if args.global_rank == 0:  # Only log from the main process
         # Sample an example from validation set
         sample_batch = next(iter(valid_dataloader))
@@ -317,9 +355,6 @@ def main(args):
 ### Generating one example before training
         with torch.no_grad():
             model.eval()
-            # sample_input = sample_batch["input_ids"].cuda() # <-- Problematic line
-            
-            # Corrected code:
             # Get the first example from the batch
             first_example = sample_batch[0] 
             # Convert its source_ids to a tensor, add batch dim, and move to GPU
@@ -331,35 +366,53 @@ def main(args):
                 num_beams=args.beam_size
             )
             
-            # Decode to text
-            # sample_input_text = tokenizer.batch_decode(sample_input, skip_special_tokens=True)[0] # <-- Also needs adjustment
-            
             # Corrected decoding:
             sample_input_text = tokenizer.decode(sample_input[0], skip_special_tokens=True) 
             
             sample_output_text = tokenizer.batch_decode(sample_output, skip_special_tokens=True)[0]
             
             # Log to ClearML
-            task.logger.report_text(
-                f"Example before training:\nInput: {sample_input_text}\nOutput: {sample_output_text}",
-                iteration=0
-            )
-        model.train() # Set model back to training mode
+            if task:
+                task.logger.report_text(
+                    f"Example before training:\nInput: {sample_input_text}\nOutput: {sample_output_text}",
+                    iteration=0
+                )
+    
+    # Add another barrier to ensure all processes wait for evaluation to complete
+    dist.barrier()
+    
+    # Make sure all processes set model to train mode
+    model.train()
+    
     for epoch in range(1, args.train_epochs + 1):
         # set seed for reproducible data split
         save_seed = args.seed
         args.seed += epoch
         set_seed(args)
         args.seed = save_seed
+        
+        # Properly set the epoch in the distributed sampler
+        if hasattr(train_dataloader.sampler, "set_epoch"):
+            train_dataloader.sampler.set_epoch(epoch)
+            logger.info(f"[Rank {args.global_rank}] Setting sampler epoch to {epoch}")
+        
         model.train()
         nb_tr_examples, nb_tr_steps, tr_loss = 0, 0, 0
         for step, examples in enumerate(train_dataloader, 1):
             if step == 1:
                 ex = examples[0]
-                logger.info(f"batch size: {len(examples)}")
-                logger.info(f"example source: {tokenizer.convert_ids_to_tokens(ex.source_ids)}")
-                # logger.info(f"example label: {tokenizer.convert_ids_to_tokens(ex.source_labels)}")
-                logger.info(f"example target: {tokenizer.convert_ids_to_tokens(ex.target_ids)}")
+                logger.info(f"[Rank {args.global_rank}] batch size: {len(examples)}")
+                logger.info(f"[Rank {args.global_rank}] example source: {tokenizer.convert_ids_to_tokens(ex.source_ids)[:20]}...")
+                logger.info(f"[Rank {args.global_rank}] example target: {tokenizer.convert_ids_to_tokens(ex.target_ids)[:20]}...")
+            
+            # Log GPU memory usage on the first step
+            if step == 1:
+                free_mem, total_mem = torch.cuda.mem_get_info(local_rank)
+                free_mb = free_mem / (1024 * 1024)
+                total_mb = total_mem / (1024 * 1024)
+                used_mb = total_mb - free_mb
+                logger.info(f"[Rank {args.global_rank}] GPU memory: using {used_mb:.2f}MB / {total_mb:.2f}MB ({(used_mb/total_mb)*100:.2f}%)")
+            
             source_ids = torch.tensor(
                 [ex.source_ids for ex in examples], dtype=torch.long
             ).to(local_rank)
@@ -397,15 +450,17 @@ def main(args):
                 if args.global_rank == 0 and global_step % args.log_steps == 0:
                     # Some Clear ML Adding
                     progress_percent = (global_step / args.train_steps) * 100
-                    task.logger.report_scalar("training", "progress", value=progress_percent, iteration=global_step)
-                    current_lr = scheduler.get_last_lr()[0]  # Get current learning rate
-                    task.logger.report_scalar("training", "learning_rate", value=current_lr, iteration=global_step)
+                    if task:
+                        task.logger.report_scalar("training", "progress", value=progress_percent, iteration=global_step)
+                        current_lr = scheduler.get_last_lr()[0]  # Get current learning rate
+                        task.logger.report_scalar("training", "learning_rate", value=current_lr, iteration=global_step)
                     train_loss = round(
                         tr_loss * args.gradient_accumulation_steps / nb_tr_steps,
                         4,
                     )
-                # Add ClearML loss tracking
-                    task.logger.report_scalar("training", "loss", value=train_loss, iteration=global_step)
+                    # Add ClearML loss tracking
+                    if task:
+                        task.logger.report_scalar("training", "loss", value=train_loss, iteration=global_step)
                     logger.info(
                         "step {}/{}: Train loss {}".format(
                             global_step,
@@ -413,17 +468,29 @@ def main(args):
                             round(train_loss, 3),
                         )
                     )
-            if global_step == args.train_steps and args.global_rank == 0:
-                # end training
-                bleu = eval_bleu_epoch(args, valid_dataloader, model, tokenizer)
-                output_dir = os.path.join(args.output_dir, "checkpoints-last" + "-" + str(bleu))
-                save_model(model, optimizer, scheduler, output_dir, config)
-                logger.info(f"Reach max steps {args.train_steps}.")
-                time.sleep(5)
+            if global_step == args.train_steps:
+                # Synchronize all processes before final evaluation
+                dist.barrier()
+                
+                # Only rank 0 performs final evaluation and checkpoint saving
+                if args.global_rank == 0:
+                    # end training
+                    bleu = eval_bleu_epoch(args, valid_dataloader, model, tokenizer)
+                    output_dir = os.path.join(args.output_dir, "checkpoints-last" + "-" + str(bleu))
+                    save_model(model, optimizer, scheduler, output_dir, config)
+                    logger.info(f"Reach max steps {args.train_steps}.")
+                    time.sleep(5)
+                
+                # All processes should return together
+                dist.barrier()
                 return
             if args.global_rank == 0 and \
                     global_step % save_steps == 0 and \
                     nb_tr_steps % args.gradient_accumulation_steps == 0:
+                # Notify other processes that evaluation is starting
+                dist.barrier()
+                
+                # Only rank 0 performs evaluation and checkpoint saving
                 bleu = eval_bleu_epoch(args, valid_dataloader, model, tokenizer)
                 output_dir = os.path.join(args.output_dir, "checkpoints-" + str(global_step) + "-" + str(bleu))
                 save_model(model, optimizer, scheduler, output_dir, config)
@@ -432,17 +499,17 @@ def main(args):
                         global_step, output_dir
                     )
                 )
+                
+                # Let the other processes know evaluation is complete
                 time.sleep(5)
+                
+            # All processes should wait here to ensure checkpoints are saved properly
+            if global_step % save_steps == 0 and nb_tr_steps % args.gradient_accumulation_steps == 0:
+                dist.barrier()
 
 
 if __name__ == '__main__':
 
-
-    # 2) Pass that session into init()
-    task = Task.init(
-        project_name="AI Powered CodeReviewer",
-        task_name="Distributed Training"
-            )
     ### make our arguments ready here
     parser = argparse.ArgumentParser()
     args = add_args(parser)
@@ -454,14 +521,11 @@ if __name__ == '__main__':
 
     ### This will suppress all the low level warnings from HuggingFace and show 
     ### us only critical level
-    logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
+    # logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
     
     ## This will log all the arguments passes(like hyper parameters)
-    logger.info(args)
+    # logger.info(args)
 
-
-    ### Also connect configuration parameters to clearML for tracking
-    task.connect_configuration(vars(args))
     main(args)
 
     logger.info('Training finished')
