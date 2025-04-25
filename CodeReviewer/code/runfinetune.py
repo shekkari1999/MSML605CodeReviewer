@@ -19,6 +19,7 @@ from utils import RefineDataset
 from torch.utils.data.distributed import DistributedSampler
 from evaluator.smooth_bleu import bleu_fromstr
 from torch.utils.data import SequentialSampler, DataLoader
+from clearml import Task  # Add import at the top level
 
 #### sets some high level logging info
 logging.basicConfig(
@@ -64,6 +65,9 @@ def get_loader(data_file, args, tokenizer, pool, eval = False):
 def eval_bleu_epoch(args, eval_dataloader, model, tokenizer):
     logger.info(f"  ***** Running bleu evaluation on {args.eval_file} *****")
     logger.info("  Batch size = %d", args.eval_batch_size)
+    # Create output directory if it doesn't exist
+    os.makedirs(args.output_dir, exist_ok=True)
+    
     model.eval()
     if hasattr(model, "module"):
         model = model.module
@@ -73,7 +77,8 @@ def eval_bleu_epoch(args, eval_dataloader, model, tokenizer):
             [ex.source_ids for ex in examples], dtype=torch.long
         ).to(args.local_rank)
         source_mask = source_ids.ne(tokenizer.pad_id)
-        preds = model.generate(source_ids,
+        preds = model.generate(
+                            input_ids=source_ids,
                             attention_mask=source_mask,
                             use_cache=True,
                             num_beams=args.beam_size,
@@ -90,10 +95,10 @@ def eval_bleu_epoch(args, eval_dataloader, model, tokenizer):
     golds = golds[:len(pred_nls)]
     for i in range(len(golds)):
         pred_nls[i], golds[i] = RefineDataset.process_pred_gold(pred_nls[i], golds[i])
-    with open(os.path.join(args.model_name_or_path, "preds.txt"), "w", encoding="utf-8") as f:
+    with open(os.path.join(args.output_dir, "preds.txt"), "w", encoding="utf-8") as f:
         for pred in pred_nls:
             f.write(pred.strip() + "\n")
-    with open(os.path.join(args.model_name_or_path, "golds.txt"), "w", encoding="utf-8") as f:
+    with open(os.path.join(args.output_dir, "golds.txt"), "w", encoding="utf-8") as f:
         for gold in golds:
             f.write(gold.strip() + "\n")
     em = 0
@@ -109,8 +114,10 @@ def eval_bleu_epoch(args, eval_dataloader, model, tokenizer):
     if args.global_rank == 0:
         task = Task.current_task()
         if task:
-            task.logger.report_scalar("evaluation", "BLEU", value=bleu, iteration=args.global_step)
-            task.logger.report_scalar("evaluation", "Exact Match", value=em, iteration=args.global_step)
+            # Add safety check for global_step
+            iteration = getattr(args, 'global_step', 0)
+            task.logger.report_scalar("evaluation", "BLEU", value=bleu, iteration=iteration)
+            task.logger.report_scalar("evaluation", "Exact Match", value=em, iteration=iteration)
             
             # Log a few examples for inspection
             if len(pred_nls) > 0:
@@ -122,7 +129,7 @@ def eval_bleu_epoch(args, eval_dataloader, model, tokenizer):
                     examples_text += f"Example {idx}:\n"
                     examples_text += f"Gold: {golds[idx]}\n"
                     examples_text += f"Pred: {pred_nls[idx]}\n\n"
-                task.logger.report_text(examples_text, iteration=args.global_step)
+                task.logger.report_text(examples_text, iteration=iteration)
     return bleu
 
 
@@ -279,7 +286,7 @@ def main(args):
     
     # Ensure all processes are synchronized before initializing DDP
     # Simple barrier without timeout (compatible with older PyTorch versions)
-    dist.barrier()
+    #dist.barrier()
 
     model = DDP(model.cuda(), device_ids = [local_rank],
                  output_device = local_rank, find_unused_parameters = True)
@@ -344,45 +351,45 @@ def main(args):
     data_tuple = get_loader(valid_file, args, tokenizer, pool, eval=True)
     _, _, valid_dataloader = data_tuple
 
-    ### Now since everything is loaded, we will add to see how output is looking before training
-    # Add barrier before sample generation to ensure all processes are in sync
-    dist.barrier()
+    # ### Now since everything is loaded, we will add to see how output is looking before training
+    # # Add barrier before sample generation to ensure all processes are in sync
+    # dist.barrier()
     
-    if args.global_rank == 0:  # Only log from the main process
-        # Sample an example from validation set
-        sample_batch = next(iter(valid_dataloader))
+    # if args.global_rank == 0:  # Only log from the main process
+    #     # Sample an example from validation set
+    #     sample_batch = next(iter(valid_dataloader))
         
-### Generating one example before training
-        with torch.no_grad():
-            model.eval()
-            # Get the first example from the batch
-            first_example = sample_batch[0] 
-            # Convert its source_ids to a tensor, add batch dim, and move to GPU
-            sample_input = torch.tensor([first_example.source_ids], dtype=torch.long).to(local_rank) 
+# ### Generating one example before training
+#         with torch.no_grad():
+#             model.eval()
+#             # Get the first example from the batch
+#             first_example = sample_batch[0] 
+#             # Convert its source_ids to a tensor, add batch dim, and move to GPU
+#             sample_input = torch.tensor([first_example.source_ids], dtype=torch.long).to(local_rank) 
             
-            sample_output = model.module.generate(
-                input_ids=sample_input,
-                max_length=args.max_target_length,
-                num_beams=args.beam_size
-            )
+#             sample_output = model.module.generate(
+#                 input_ids=sample_input,
+#                 max_length=args.max_target_length,
+#                 num_beams=args.beam_size
+#             )
             
-            # Corrected decoding:
-            sample_input_text = tokenizer.decode(sample_input[0], skip_special_tokens=True) 
+#             # Corrected decoding:
+#             sample_input_text = tokenizer.decode(sample_input[0], skip_special_tokens=True) 
             
-            sample_output_text = tokenizer.batch_decode(sample_output, skip_special_tokens=True)[0]
+#             sample_output_text = tokenizer.batch_decode(sample_output, skip_special_tokens=True)[0]
             
-            # Log to ClearML
-            if task:
-                task.logger.report_text(
-                    f"Example before training:\nInput: {sample_input_text}\nOutput: {sample_output_text}",
-                    iteration=0
-                )
+#             # Log to ClearML
+#             if task:
+#                 task.logger.report_text(
+#                     f"Example before training:\nInput: {sample_input_text}\nOutput: {sample_output_text}",
+#                     iteration=0
+#                 )
     
-    # Add another barrier to ensure all processes wait for evaluation to complete
-    dist.barrier()
+#     # Add another barrier to ensure all processes wait for evaluation to complete
+#     dist.barrier()
     
-    # Make sure all processes set model to train mode
-    model.train()
+#     # Make sure all processes set model to train mode
+#     model.train()
     
     for epoch in range(1, args.train_epochs + 1):
         # set seed for reproducible data split
@@ -402,8 +409,8 @@ def main(args):
             if step == 1:
                 ex = examples[0]
                 logger.info(f"[Rank {args.global_rank}] batch size: {len(examples)}")
-                logger.info(f"[Rank {args.global_rank}] example source: {tokenizer.convert_ids_to_tokens(ex.source_ids)[:20]}...")
-                logger.info(f"[Rank {args.global_rank}] example target: {tokenizer.convert_ids_to_tokens(ex.target_ids)[:20]}...")
+                #logger.info(f"[Rank {args.global_rank}] example source: {tokenizer.convert_ids_to_tokens(ex.source_ids)[:20]}...")
+                #logger.info(f"[Rank {args.global_rank}] example target: {tokenizer.convert_ids_to_tokens(ex.target_ids)[:20]}...")
             
             # Log GPU memory usage on the first step
             if step == 1:
@@ -487,25 +494,22 @@ def main(args):
             if args.global_rank == 0 and \
                     global_step % save_steps == 0 and \
                     nb_tr_steps % args.gradient_accumulation_steps == 0:
-                # Notify other processes that evaluation is starting
-                dist.barrier()
-                
                 # Only rank 0 performs evaluation and checkpoint saving
+                logger.info(f"[Rank {args.global_rank}] Starting checkpoint evaluation at step {global_step}")
                 bleu = eval_bleu_epoch(args, valid_dataloader, model, tokenizer)
                 output_dir = os.path.join(args.output_dir, "checkpoints-" + str(global_step) + "-" + str(bleu))
                 save_model(model, optimizer, scheduler, output_dir, config)
                 logger.info(
-                    "Save the {}-step model and optimizer into {}".format(
-                        global_step, output_dir
-                    )
+                    f"[Rank {args.global_rank}] Checkpoint saved: {global_step}-step model and optimizer into {output_dir}"
                 )
-                
-                # Let the other processes know evaluation is complete
-                time.sleep(5)
-                
+                # Signal that rank 0 is done with checkpoint saving
+                torch.cuda.synchronize()  # Ensure GPU operations are complete
+            
             # All processes should wait here to ensure checkpoints are saved properly
             if global_step % save_steps == 0 and nb_tr_steps % args.gradient_accumulation_steps == 0:
+                # First barrier: ensures rank 0 completes saving before other ranks proceed
                 dist.barrier()
+                logger.info(f"[Rank {args.global_rank}] Passed checkpoint barrier at step {global_step}, continuing training")
 
 
 if __name__ == '__main__':
@@ -521,10 +525,10 @@ if __name__ == '__main__':
 
     ### This will suppress all the low level warnings from HuggingFace and show 
     ### us only critical level
-    # logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
+    logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
     
     ## This will log all the arguments passes(like hyper parameters)
-    # logger.info(args)
+    logger.info(args)
 
     main(args)
 
