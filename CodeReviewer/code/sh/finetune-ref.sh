@@ -6,13 +6,13 @@
   MASTER_HOST=localhost && echo MASTER_HOST: ${MASTER_HOST}
   MASTER_PORT=23333 && echo MASTER_PORT: ${MASTER_PORT}
   RANK=0 && echo RANK: ${RANK}
-  PER_NODE_GPU=2 && echo PER_NODE_GPU: ${PER_NODE_GPU}
-  WORLD_SIZE=2 && echo WORLD_SIZE: ${WORLD_SIZE}
+  PER_NODE_GPU=4 && echo PER_NODE_GPU: ${PER_NODE_GPU}
+  WORLD_SIZE=4 && echo WORLD_SIZE: ${WORLD_SIZE}
   NODES=1 && echo NODES: ${NODES}
   NCCL_DEBUG=INFO
 
-  # Install required packages if not already installed
-  pip install nltk tqdm transformers peft -q
+   # Install required packages if not already installed
+  pip install nltk tqdm transformers peft clearml -q
   
   # Download NLTK punkt package
   python -c "import nltk; nltk.download('punkt')"
@@ -24,8 +24,12 @@
   echo "Checking data files..."
   ls -la ../data
 
+  export CLEARML_API_ACCESS_KEY="IUZD0AET8S29Q5PCRQQVFHNEA33WF2"
+  export CLEARML_API_SECRET_KEY="OKVNC_EnDpdk5wXOLlmru07Hw4Ik_pWAwx7Dl-WUbJ5i8EXnDzX-6ka_kuEDnI8kksI"
+  export CLEARML_SERVER_HOST="https://app.clearml.com"
+  
   # Use torchrun instead of torch.distributed.launch with correct data paths
-  torchrun --nproc_per_node=${PER_NODE_GPU} --node_rank=${RANK} --nnodes=${NODES} --master_addr=${MASTER_HOST} --master_port=${MASTER_PORT} ../run_finetune_ref.py  \
+  torchrun --nproc_per_node=${PER_NODE_GPU} --node_rank=${RANK} --nnodes=${NODES} --master_addr=${MASTER_HOST} --master_port=${MASTER_PORT} ../runfinetune.py  \
     --train_epochs 1 \
     --model_name_or_path microsoft/codereviewer \
     --output_dir ../../save/ref \
@@ -33,7 +37,7 @@
     --dev_filename ../data/ref-valid.jsonl \
     --max_source_length 200 \
     --max_target_length 200 \
-    --train_batch_size 6 \
+    --train_batch_size 20 \
     --learning_rate 3e-4 \
     --gradient_accumulation_steps 3 \
     --mask_rate 0.15 \

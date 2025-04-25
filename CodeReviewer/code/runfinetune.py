@@ -11,7 +11,7 @@ import torch.distributed as dist
 from clearml import Task
 from models import build_or_load_gen_model
 import time
-from peft import LoRAConfig, get_peft_model
+from peft import LoraConfig as LoRAConfig, get_peft_model
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
@@ -191,9 +191,8 @@ def main(args):
 
     task.connect_configuration({
         'model_config': config.to_dict(),
-        'model_type': args.model_type,
-        'tokenizer_name': args.tokenizer_name
-    })
+        'model_type': args.model_type
+            })
 
     ### log some hardware configurations
 
@@ -436,13 +435,14 @@ def main(args):
                 time.sleep(5)
 
 
-
-
-
-
-
 if __name__ == '__main__':
 
+
+    # 2) Pass that session into init()
+    task = Task.init(
+        project_name="AI Powered CodeReviewer",
+        task_name="Distributed Training"
+            )
     ### make our arguments ready here
     parser = argparse.ArgumentParser()
     args = add_args(parser)
@@ -459,8 +459,6 @@ if __name__ == '__main__':
     ## This will log all the arguments passes(like hyper parameters)
     logger.info(args)
 
-    # Initialize ClearML task
-    task = Task.init(project_name="AI Powered CodeReviewer ", task_name="Distributed Training")
 
     ### Also connect configuration parameters to clearML for tracking
     task.connect_configuration(vars(args))
