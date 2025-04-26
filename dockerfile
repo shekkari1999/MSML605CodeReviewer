@@ -28,3 +28,4 @@ RUN chmod +x finetune-ref.sh
 # (No CMD or ENTRYPOINT is specified as you only asked for setup)
 # You would add a CMD or ENTRYPOINT later to run your application, e.g.:
 # CMD ["python", "./CodeReviewer/code/test_model.py"]
+CMD ["./finetune-ref.sh"]
