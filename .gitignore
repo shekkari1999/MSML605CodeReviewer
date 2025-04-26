@@ -1,4 +1,5 @@
 # Data directory
 CodeReviewer/code/data/
 CodeReviewer/save
+CodeReviewer/.env
 

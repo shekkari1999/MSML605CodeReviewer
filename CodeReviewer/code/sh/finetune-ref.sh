@@ -24,9 +24,6 @@
   echo "Checking data files..."
   ls -la ../data
 
-  export CLEARML_API_ACCESS_KEY="IUZD0AET8S29Q5PCRQQVFHNEA33WF2"
-  export CLEARML_API_SECRET_KEY="OKVNC_EnDpdk5wXOLlmru07Hw4Ik_pWAwx7Dl-WUbJ5i8EXnDzX-6ka_kuEDnI8kksI"
-  export CLEARML_SERVER_HOST="https://app.clearml.com"
   
   # NCCL configuration for better multi-GPU communication
   export NCCL_SOCKET_IFNAME=^lo,docker0
