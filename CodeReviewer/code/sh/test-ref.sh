@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # batch size 6 for 16 GB GPU
 
 mnt_dir="/home/codereview"
