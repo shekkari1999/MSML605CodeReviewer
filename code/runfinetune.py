@@ -20,7 +20,7 @@ from utils import RefineDataset
 from torch.utils.data.distributed import DistributedSampler
 from evaluator.smooth_bleu import bleu_fromstr
 from torch.utils.data import SequentialSampler, DataLoader
-from clearml import Task  # Add import at the top level
+from clearml import Task, Dataset  # Add import at the top level
 
 #### sets some high level logging info
 logging.basicConfig(
@@ -63,8 +63,8 @@ def get_loader(data_file, args, tokenizer, pool, eval = False):
 
 
 ### eval function compares predictions with gold references(ground truth)
-def eval_bleu_epoch(args, eval_dataloader, model, tokenizer):
-    logger.info(f"  ***** Running bleu evaluation on {args.eval_file} *****")
+def eval_bleu_epoch(args, eval_dataloader, model, tokenizer, valid_file):  # Added valid_file argument
+    logger.info(f"  ***** Running bleu evaluation on {valid_file} *****")
     logger.info("  Batch size = %d", args.eval_batch_size)
     # Create output directory if it doesn't exist
     os.makedirs(args.output_dir, exist_ok=True)
@@ -88,7 +88,6 @@ def eval_bleu_epoch(args, eval_dataloader, model, tokenizer):
         top_preds = list(preds.cpu().numpy())
         pred_ids.extend(top_preds)
     pred_nls = [tokenizer.decode(id, skip_special_tokens=True, clean_up_tokenization_spaces=False) for id in pred_ids]
-    valid_file = args.dev_filename
     golds = []
     with open(valid_file, "r") as f:
         for line in f:
@@ -160,7 +159,53 @@ def save_model(model, optimizer, scheduler, output_dir, config):
     )
 
 
+def get_data_path(args, dataset_type, default_path, clearml_dataset_id, expected_filename):
+    """Determines the data path, fetching from ClearML if an ID is provided."""
+    data_path = default_path
+    fetch_success = True  # Assume success initially
+
+    if clearml_dataset_id:
+        if args.global_rank == 0:  # Only rank 0 downloads
+            logger.info(f"Attempting to fetch {dataset_type} dataset from ClearML ID: {clearml_dataset_id}")
+            try:
+                dataset_obj = Dataset.get(dataset_id=clearml_dataset_id)
+                dataset_folder = dataset_obj.get_local_copy()
+                fetched_path = os.path.join(dataset_folder, expected_filename)
+
+                if os.path.exists(fetched_path):
+                    data_path = fetched_path
+                    logger.info(f"Using {dataset_type} data from ClearML dataset: {data_path}")
+                else:
+                    logger.error(f"File '{expected_filename}' not found in ClearML {dataset_type} dataset folder: {dataset_folder}")
+                    fetch_success = False  # Mark fetch as failed
+            except Exception as e:
+                logger.error(f"Failed to get {dataset_type} dataset from ClearML (ID: {clearml_dataset_id}): {e}")
+                fetch_success = False  # Mark fetch as failed
+
+            # If fetch failed, log fallback
+            if not fetch_success:
+                logger.warning(f"Falling back to default {dataset_type} path: {default_path}")
+                data_path = default_path  # Ensure fallback path is set
+
+        # Synchronize all processes: wait for rank 0
+        dist.barrier()
+
+        # Broadcast the determined path and success status from rank 0
+        if args.world_size > 1:
+            broadcast_list = [data_path, fetch_success]
+            dist.broadcast_object_list(broadcast_list, src=0)
+            data_path = broadcast_list[0]
+            fetch_success = broadcast_list[1]  # Other ranks get the success status
+            logger.info(f"[Rank {args.global_rank}] Received {dataset_type} data path: {data_path} (Fetch success: {fetch_success})")
+
+    else:
+        logger.info(f"Using {dataset_type} data from command line argument: {data_path}")
+
+    return data_path
+
+
 def main(args):
+
 
     ### our main Distributed Data Parallel task starts, with this method
     dist.init_process_group(backend = 'nccl')
@@ -342,8 +387,13 @@ def main(args):
     global_step = 0 
     
     save_steps = args.save_steps
-    train_file = args.train_filename ### data_file
-    valid_file = args.dev_filename
+
+    # --- Determine Data Paths using Helper Function ---
+    train_file = get_data_path(args, "training", args.train_filename,
+                               args.clearml_train_dataset_id, "ref-train.jsonl")
+    valid_file = get_data_path(args, "validation", args.dev_filename,
+                               args.clearml_valid_dataset_id, "ref-valid.jsonl")
+    # --- End of Data Path Determination ---
 
     #### here go back to the first method of this page
     data_tuple = get_loader(train_file, args, tokenizer, pool)        # WARNING: this is a iterator, to save memory
@@ -352,46 +402,6 @@ def main(args):
     data_tuple = get_loader(valid_file, args, tokenizer, pool, eval=True)
     _, _, valid_dataloader = data_tuple
 
-    # ### Now since everything is loaded, we will add to see how output is looking before training
-    # # Add barrier before sample generation to ensure all processes are in sync
-    # dist.barrier()
-    
-    # if args.global_rank == 0:  # Only log from the main process
-    #     # Sample an example from validation set
-    #     sample_batch = next(iter(valid_dataloader))
-        
-# ### Generating one example before training
-#         with torch.no_grad():
-#             model.eval()
-#             # Get the first example from the batch
-#             first_example = sample_batch[0] 
-#             # Convert its source_ids to a tensor, add batch dim, and move to GPU
-#             sample_input = torch.tensor([first_example.source_ids], dtype=torch.long).to(local_rank) 
-            
-#             sample_output = model.module.generate(
-#                 input_ids=sample_input,
-#                 max_length=args.max_target_length,
-#                 num_beams=args.beam_size
-#             )
-            
-#             # Corrected decoding:
-#             sample_input_text = tokenizer.decode(sample_input[0], skip_special_tokens=True) 
-            
-#             sample_output_text = tokenizer.batch_decode(sample_output, skip_special_tokens=True)[0]
-            
-#             # Log to ClearML
-#             if task:
-#                 task.logger.report_text(
-#                     f"Example before training:\nInput: {sample_input_text}\nOutput: {sample_output_text}",
-#                     iteration=0
-#                 )
-    
-#     # Add another barrier to ensure all processes wait for evaluation to complete
-#     dist.barrier()
-    
-#     # Make sure all processes set model to train mode
-#     model.train()
-    
     for epoch in range(1, args.train_epochs + 1):
         # set seed for reproducible data split
         save_seed = args.seed
@@ -483,7 +493,7 @@ def main(args):
                 # Only rank 0 performs final evaluation and checkpoint saving
                 if args.global_rank == 0:
                     # end training
-                    bleu = eval_bleu_epoch(args, valid_dataloader, model, tokenizer)
+                    bleu = eval_bleu_epoch(args, valid_dataloader, model, tokenizer, valid_file)
                     output_dir = os.path.join(args.output_dir, "checkpoints-last" + "-" + str(bleu))
                     save_model(model, optimizer, scheduler, output_dir, config)
                     logger.info(f"Reach max steps {args.train_steps}.")
@@ -497,7 +507,7 @@ def main(args):
                     nb_tr_steps % args.gradient_accumulation_steps == 0:
                 # Only rank 0 performs evaluation and checkpoint saving
                 logger.info(f"[Rank {args.global_rank}] Starting checkpoint evaluation at step {global_step}")
-                bleu = eval_bleu_epoch(args, valid_dataloader, model, tokenizer)
+                bleu = eval_bleu_epoch(args, valid_dataloader, model, tokenizer, valid_file)
                 output_dir = os.path.join(args.output_dir, "checkpoints-" + str(global_step) + "-" + str(bleu))
                 save_model(model, optimizer, scheduler, output_dir, config)
                 logger.info(

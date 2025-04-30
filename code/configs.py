@@ -199,7 +199,20 @@ def add_args(parser):
     parser.add_argument(
         "--seed", type=int, default=2233, help="random seed for initialization"
     )  # previous one 42
+    # Or in configs.py if add_args is defined there
 
+    parser.add_argument(
+        "--clearml_train_dataset_id",
+        type=str,
+        default=None,
+        help="ClearML Dataset ID to fetch training data from. Overrides train_filename if provided.",
+    )
+    parser.add_argument(
+        "--clearml_valid_dataset_id",
+        type=str,
+        default=None,
+        help="ClearML Dataset ID to fetch validation data from. Overrides dev_filename if provided.",
+    )
     args = parser.parse_args()
     return args
 
