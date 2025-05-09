@@ -20,7 +20,8 @@ from utils import RefineDataset
 from torch.utils.data.distributed import DistributedSampler
 from evaluator.smooth_bleu import bleu_fromstr
 from torch.utils.data import SequentialSampler, DataLoader
-from clearml import Task, Dataset  # Add import at the top level
+from clearml import Task, Dataset, OutputModel  # Add import at the top level
+import re
 
 #### sets some high level logging info
 logging.basicConfig(
@@ -138,26 +139,42 @@ def save_model(model, optimizer, scheduler, output_dir, config):
     if hasattr(model, "save_pretrained"):
         model.save_pretrained(output_dir)
         logger.info("Saved LoRA adapter weights to %s", output_dir)
-        return
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    model_to_save = model.module if hasattr(model, "module") else model
-    config.save_pretrained(output_dir)
-    output_model_file = os.path.join(output_dir, "pytorch_model.bin")
-    torch.save(model_to_save.state_dict(), output_model_file)
-    output_optimizer_file = os.path.join(output_dir, "optimizer.pt")
-    torch.save(
-        optimizer.state_dict(),
-        output_optimizer_file,
-        _use_new_zipfile_serialization=False,
-    )
-    output_scheduler_file = os.path.join(output_dir, "scheduler.pt")
-    torch.save(
-        scheduler.state_dict(),
-        output_scheduler_file,
-        _use_new_zipfile_serialization=False,
-    )
+    else:
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        model_to_save = model.module if hasattr(model, "module") else model
+        config.save_pretrained(output_dir)
+        output_model_file = os.path.join(output_dir, "pytorch_model.bin")
+        torch.save(model_to_save.state_dict(), output_model_file)
+        output_optimizer_file = os.path.join(output_dir, "optimizer.pt")
+        torch.save(
+            optimizer.state_dict(),
+            output_optimizer_file,
+            _use_new_zipfile_serialization=False,
+        )
+        output_scheduler_file = os.path.join(output_dir, "scheduler.pt")
+        torch.save(
+            scheduler.state_dict(),
+            output_scheduler_file,
+            _use_new_zipfile_serialization=False
 
+        )
+     # Upload LoRA adapter folder as a generic artifact
+    task = Task.current_task()
+    task.upload_artifact(
+        name="lora-adapter",
+        artifact_object=output_dir
+     )
+ 
+    # Register adapter under ClearML Models registry
+    out_model = OutputModel(
+        task=task,
+        name="AICodeReviewer-LoRA",
+        framework="pytorch"
+    )
+    out_model.update_weights(
+        weights_filename=os.path.join(output_dir, "pytorch_model.bin")
+    )
 
 def get_data_path(args, dataset_type, default_path, clearml_dataset_id, expected_filename):
     """Determines the data path, fetching from ClearML if an ID is provided."""
@@ -203,6 +220,21 @@ def get_data_path(args, dataset_type, default_path, clearml_dataset_id, expected
 
     return data_path
 
+def find_latest_checkpoint(output_dir):
+    """Find the latest checkpoint directory by step number."""
+    checkpoint_dirs = []
+    pattern = re.compile(r"checkpoints-(\d+)-")
+    if not os.path.exists(output_dir):
+        return None, 0
+    for d in os.listdir(output_dir):
+        m = pattern.match(d)
+        if m:
+            step = int(m.group(1))
+            checkpoint_dirs.append((step, os.path.join(output_dir, d)))
+    if not checkpoint_dirs:
+        return None, 0
+    checkpoint_dirs.sort()
+    return checkpoint_dirs[-1][1], checkpoint_dirs[-1][0]
 
 def main(args):
 
@@ -401,6 +433,26 @@ def main(args):
 
     data_tuple = get_loader(valid_file, args, tokenizer, pool, eval=True)
     _, _, valid_dataloader = data_tuple
+     # Check for latest checkpoint
+    latest_ckpt_dir, latest_step = find_latest_checkpoint(args.output_dir)
+    resume_from_ckpt = False
+    if latest_ckpt_dir:
+        model_ckpt = os.path.join(latest_ckpt_dir, "pytorch_model.bin")
+        optimizer_ckpt = os.path.join(latest_ckpt_dir, "optimizer.pt")
+        scheduler_ckpt = os.path.join(latest_ckpt_dir, "scheduler.pt")
+        if os.path.exists(model_ckpt):
+            logger.info(f"Resuming model from checkpoint: {latest_ckpt_dir}")
+            state_dict = torch.load(model_ckpt, map_location="cpu")
+            model.module.load_state_dict(state_dict, strict=False)
+            resume_from_ckpt = True
+        if os.path.exists(optimizer_ckpt):
+            optimizer.load_state_dict(torch.load(optimizer_ckpt, map_location="cpu"))
+        if os.path.exists(scheduler_ckpt):
+            scheduler.load_state_dict(torch.load(scheduler_ckpt, map_location="cpu"))
+
+    global_step = latest_step if resume_from_ckpt else 0
+    if resume_from_ckpt:
+        logger.info(f"[Rank {args.global_rank}] Training will resume from step {global_step}")
 
     for epoch in range(1, args.train_epochs + 1):
         # set seed for reproducible data split
@@ -493,8 +545,9 @@ def main(args):
                 # Only rank 0 performs final evaluation and checkpoint saving
                 if args.global_rank == 0:
                     # end training
+                    output_dir = os.path.join(args.output_dir, "checkpoints-last")
+                    save_model(model, optimizer, scheduler, output_dir, config)
                     bleu = eval_bleu_epoch(args, valid_dataloader, model, tokenizer, valid_file)
-                    output_dir = os.path.join(args.output_dir, "checkpoints-last" + "-" + str(bleu))
                     save_model(model, optimizer, scheduler, output_dir, config)
                     logger.info(f"Reach max steps {args.train_steps}.")
                     time.sleep(5)
@@ -502,14 +555,17 @@ def main(args):
                 # All processes should return together
                 dist.barrier()
                 return
+            
+            if global_step <= latest_step:
+                continue  # Skip steps already completed
             if args.global_rank == 0 and \
                     global_step % save_steps == 0 and \
                     nb_tr_steps % args.gradient_accumulation_steps == 0:
                 # Only rank 0 performs evaluation and checkpoint saving
                 logger.info(f"[Rank {args.global_rank}] Starting checkpoint evaluation at step {global_step}")
-                bleu = eval_bleu_epoch(args, valid_dataloader, model, tokenizer, valid_file)
-                output_dir = os.path.join(args.output_dir, "checkpoints-" + str(global_step) + "-" + str(bleu))
+                output_dir = os.path.join(args.output_dir, "checkpoints-" + str(global_step))
                 save_model(model, optimizer, scheduler, output_dir, config)
+                bleu = eval_bleu_epoch(args, valid_dataloader, model, tokenizer, valid_file)
                 logger.info(
                     f"[Rank {args.global_rank}] Checkpoint saved: {global_step}-step model and optimizer into {output_dir}"
                 )

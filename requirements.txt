@@ -2,8 +2,10 @@ clearml==1.17.1
 nltk==3.9.1
 numpy==2.2.5
 peft==0.12.0
+scikit-learn==1.4.2
 tokenizers==0.21.1
 torch==2.4.0
 tqdm==4.66.5
 transformers==4.47.1
 tree_sitter==0.24.0
+pandas==2.2.2
