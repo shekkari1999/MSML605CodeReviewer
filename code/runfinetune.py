@@ -457,17 +457,34 @@ def main(args):
                         # This will cause resume_from_ckpt to remain False, and it will try local checkpoints.
                     else:
                         logger.info(f"Artifact {artifact.name} made available at: {downloaded_path}")
-                        # downloaded_path is the path to the extracted directory, e.g., /path/to/clearml_downloads/task_id/lora-adapter/
-                        # If the artifact itself is the checkpoint directory (e.g. "checkpoints-1100")
-                        dir_name = os.path.basename(downloaded_path)
-                        match = re.match(r"checkpoints-(\d+)", dir_name)
-                        if match and os.path.isdir(downloaded_path):
-                            latest_ckpt_dir = downloaded_path
-                            latest_step = int(match.group(1))
-                            resume_from_ckpt = True
-                            logger.info(f"Successfully downloaded and identified checkpoint '{dir_name}' from ClearML. Path: {latest_ckpt_dir}. Resuming from step {latest_step}.")
+                        
+                        # Check if downloaded_path is a directory and look for 'checkpoints-XXXX' subdirectories
+                        if os.path.isdir(downloaded_path):
+                            ckpt_subdirs = []
+                            for item_name in os.listdir(downloaded_path):
+                                item_path = os.path.join(downloaded_path, item_name)
+                                # Check if it's a directory and matches the pattern "checkpoints-<digits>"
+                                if os.path.isdir(item_path):
+                                    match = re.match(r"checkpoints-(\d+)", item_name)
+                                    if match:
+                                        step = int(match.group(1))
+                                        ckpt_subdirs.append({'step': step, 'path': item_path, 'name': item_name})
+                            
+                            if ckpt_subdirs:
+                                # Sort by step number in descending order (latest first)
+                                ckpt_subdirs.sort(key=lambda x: x['step'], reverse=True)
+                                chosen_ckpt = ckpt_subdirs[0] # Select the one with the highest step
+                                
+                                latest_ckpt_dir = chosen_ckpt['path']
+                                latest_step = chosen_ckpt['step']
+                                resume_from_ckpt = True
+                                logger.info(f"Found checkpoint directory '{chosen_ckpt['name']}' inside downloaded ClearML artifact. Path: {latest_ckpt_dir}. Resuming from step {latest_step}.")
+                                if len(ckpt_subdirs) > 1:
+                                    logger.warning(f"Multiple checkpoint-like subdirectories found: {[d['name'] for d in ckpt_subdirs]}. Used the latest: '{chosen_ckpt['name']}'.")
+                            else:
+                                logger.warning(f"No 'checkpoints-XXXX' subdirectory found inside '{downloaded_path}'. Will not resume from this ClearML artifact.")
                         else:
-                            logger.warning(f"Could not parse step from ClearML checkpoint directory name: '{dir_name}' or it's not a directory. Path: {downloaded_path}. Will not resume from this ClearML checkpoint.")
+                            logger.warning(f"Downloaded path '{downloaded_path}' for artifact '{artifact.name}' is not a directory. Cannot search for checkpoints within it.")
                 else:
                     logger.warning(f"Artifact '{artifact_to_load_name}' not found in ClearML task {args.clearml_load_task_id}. Available artifacts: {list(source_task.artifacts.keys())}")
             except Exception as e:
