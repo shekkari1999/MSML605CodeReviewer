@@ -53,8 +53,8 @@ torchrun --nproc_per_node=${PER_NODE_GPU} --node_rank=${RANK} --nnodes=${NODES} 
   --clearml_valid_dataset_id "f03c1b21febe4c22ac498d38c511b216" \
   --max_source_length 200 \
   --max_target_length 200 \
-  --train_batch_size 32 \
-  --eval_batch_size 32 \
+  --train_batch_size 24 \
+  --eval_batch_size 24 \
   --learning_rate 3e-4 \
   --gradient_accumulation_steps 1 \
   --mask_rate 0.15 \

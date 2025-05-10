@@ -170,7 +170,7 @@ def add_args(parser):
     parser.add_argument(
         "--log_steps", default=-1, type=int,
     )
-    parser.add_argument("--eval_steps", default=-1, type=int, help="")
+    parser.add_argument("--eval_steps", default=1000, type=int, help="")
     parser.add_argument("--eval_file", default="", type=str)
     parser.add_argument("--out_file", default="", type=str)
     parser.add_argument("--break_cnt", default=-1, type=int)
@@ -216,7 +216,7 @@ def add_args(parser):
     parser.add_argument(
         "--clearml_load_task_id",
         type=str,
-        default="091d010e69e04fb1aca8708bd30ad2da",
+        default="6a5d6d1b47754c22a2f5b0b0d0e2c6f4",
         help="ClearML Task ID to load checkpoint from."
     )
     parser.add_argument(
