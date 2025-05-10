@@ -457,27 +457,52 @@ def main(args):
                         # This will cause resume_from_ckpt to remain False, and it will try local checkpoints.
                     else:
                         logger.info(f"Artifact {artifact.name} made available at: {downloaded_path}")
-                        # downloaded_path is the path to the directory where the archive was extracted.
-                        # We need to find the actual checkpoint directory (e.g., "checkpoints-1100") inside it.
-                        
                         found_checkpoint_in_artifact = False
-                        if os.path.isdir(downloaded_path):
-                            logger.info(f"Listing contents of extracted artifact directory: {downloaded_path}")
+                        
+                        # Try to parse step number from artifact URL or downloaded_path name
+                        parsed_step = None
+                        # Check artifact URL first (e.g., .../checkpoints-1100.zip)
+                        url_basename = os.path.basename(artifact.url)
+                        step_match_url = re.match(r"checkpoints-(\d+)\.zip", url_basename, re.IGNORECASE)
+                        if step_match_url:
+                            parsed_step = int(step_match_url.group(1))
+                        else:
+                            # Fallback: check downloaded_path's basename (e.g., ..._checkpoints-1100_archive...)
+                            path_basename = os.path.basename(downloaded_path)
+                            step_match_path = re.search(r"checkpoints-(\d+)", path_basename)
+                            if step_match_path:
+                                parsed_step = int(step_match_path.group(1))
+
+                        # Attempt 1: Is downloaded_path itself the checkpoint directory?
+                        # Check for a key checkpoint file like 'pytorch_model.bin'.
+                        if parsed_step is not None and \
+                           os.path.isdir(downloaded_path) and \
+                           os.path.exists(os.path.join(downloaded_path, "pytorch_model.bin")):
+                            
+                            latest_ckpt_dir = downloaded_path
+                            latest_step = parsed_step
+                            resume_from_ckpt = True
+                            found_checkpoint_in_artifact = True
+                            logger.info(f"Successfully identified checkpoint directly in extracted artifact path: '{downloaded_path}'. Resuming from step {latest_step}.")
+                        
+                        # Attempt 2: If not, look for a 'checkpoints-XXXX' subdirectory
+                        elif os.path.isdir(downloaded_path):
+                            logger.info(f"Checkpoint not found directly. Searching for 'checkpoints-XXXX' subdirectory in: {downloaded_path}")
                             for item_name in os.listdir(downloaded_path):
                                 item_path = os.path.join(downloaded_path, item_name)
-                                # The pattern should match "checkpoints-STEP_NUMBER"
                                 match = re.match(r"checkpoints-(\d+)", item_name)
-                                if match and os.path.isdir(item_path):
+                                # Ensure it's a directory and contains a key checkpoint file
+                                if match and os.path.isdir(item_path) and \
+                                   os.path.exists(os.path.join(item_path, "pytorch_model.bin")):
                                     latest_ckpt_dir = item_path
                                     latest_step = int(match.group(1))
                                     resume_from_ckpt = True
                                     found_checkpoint_in_artifact = True
-                                    logger.info(f"Successfully found and identified checkpoint directory '{item_name}' inside ClearML artifact. Path: {latest_ckpt_dir}. Resuming from step {latest_step}.")
-                                    break # Found the checkpoint directory
+                                    logger.info(f"Found checkpoint subdirectory '{item_name}' in artifact. Path: {latest_ckpt_dir}. Step: {latest_step}.")
+                                    break 
                         
                         if not found_checkpoint_in_artifact:
-                            logger.warning(f"Could not find a 'checkpoints-XXXX' subdirectory within the extracted artifact path: '{downloaded_path}'. Will not resume from this ClearML checkpoint.")
-                            # resume_from_ckpt remains False, will fall back to local checkpoints.
+                            logger.warning(f"Could not find a valid checkpoint in '{downloaded_path}' (checked directly and for 'checkpoints-XXXX' subdirs). Will not resume from this ClearML artifact.")
                 else:
                     logger.warning(f"Artifact '{artifact_to_load_name}' not found in ClearML task {args.clearml_load_task_id}. Available artifacts: {list(source_task.artifacts.keys())}")
             except Exception as e:
