@@ -457,34 +457,27 @@ def main(args):
                         # This will cause resume_from_ckpt to remain False, and it will try local checkpoints.
                     else:
                         logger.info(f"Artifact {artifact.name} made available at: {downloaded_path}")
+                        # downloaded_path is the path to the directory where the archive was extracted.
+                        # We need to find the actual checkpoint directory (e.g., "checkpoints-1100") inside it.
                         
-                        # Check if downloaded_path is a directory and look for 'checkpoints-XXXX' subdirectories
+                        found_checkpoint_in_artifact = False
                         if os.path.isdir(downloaded_path):
-                            ckpt_subdirs = []
+                            logger.info(f"Listing contents of extracted artifact directory: {downloaded_path}")
                             for item_name in os.listdir(downloaded_path):
                                 item_path = os.path.join(downloaded_path, item_name)
-                                # Check if it's a directory and matches the pattern "checkpoints-<digits>"
-                                if os.path.isdir(item_path):
-                                    match = re.match(r"checkpoints-(\d+)", item_name)
-                                    if match:
-                                        step = int(match.group(1))
-                                        ckpt_subdirs.append({'step': step, 'path': item_path, 'name': item_name})
-                            
-                            if ckpt_subdirs:
-                                # Sort by step number in descending order (latest first)
-                                ckpt_subdirs.sort(key=lambda x: x['step'], reverse=True)
-                                chosen_ckpt = ckpt_subdirs[0] # Select the one with the highest step
-                                
-                                latest_ckpt_dir = chosen_ckpt['path']
-                                latest_step = chosen_ckpt['step']
-                                resume_from_ckpt = True
-                                logger.info(f"Found checkpoint directory '{chosen_ckpt['name']}' inside downloaded ClearML artifact. Path: {latest_ckpt_dir}. Resuming from step {latest_step}.")
-                                if len(ckpt_subdirs) > 1:
-                                    logger.warning(f"Multiple checkpoint-like subdirectories found: {[d['name'] for d in ckpt_subdirs]}. Used the latest: '{chosen_ckpt['name']}'.")
-                            else:
-                                logger.warning(f"No 'checkpoints-XXXX' subdirectory found inside '{downloaded_path}'. Will not resume from this ClearML artifact.")
-                        else:
-                            logger.warning(f"Downloaded path '{downloaded_path}' for artifact '{artifact.name}' is not a directory. Cannot search for checkpoints within it.")
+                                # The pattern should match "checkpoints-STEP_NUMBER"
+                                match = re.match(r"checkpoints-(\d+)", item_name)
+                                if match and os.path.isdir(item_path):
+                                    latest_ckpt_dir = item_path
+                                    latest_step = int(match.group(1))
+                                    resume_from_ckpt = True
+                                    found_checkpoint_in_artifact = True
+                                    logger.info(f"Successfully found and identified checkpoint directory '{item_name}' inside ClearML artifact. Path: {latest_ckpt_dir}. Resuming from step {latest_step}.")
+                                    break # Found the checkpoint directory
+                        
+                        if not found_checkpoint_in_artifact:
+                            logger.warning(f"Could not find a 'checkpoints-XXXX' subdirectory within the extracted artifact path: '{downloaded_path}'. Will not resume from this ClearML checkpoint.")
+                            # resume_from_ckpt remains False, will fall back to local checkpoints.
                 else:
                     logger.warning(f"Artifact '{artifact_to_load_name}' not found in ClearML task {args.clearml_load_task_id}. Available artifacts: {list(source_task.artifacts.keys())}")
             except Exception as e:
