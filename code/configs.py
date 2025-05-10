@@ -216,7 +216,7 @@ def add_args(parser):
     parser.add_argument(
         "--clearml_load_task_id",
         type=str,
-        default=None,
+        default="091d010e69e04fb1aca8708bd30ad2da",
         help="ClearML Task ID to load checkpoint from."
     )
     parser.add_argument(
