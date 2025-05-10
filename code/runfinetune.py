@@ -449,27 +449,25 @@ def main(args):
                     artifact = source_task.artifacts[artifact_to_load_name]
                     logger.info(f"Downloading artifact: {artifact.name} (URL: {artifact.url}) from task {args.clearml_load_task_id}")
                     
-                    clearml_download_parent_dir = os.path.join(args.output_dir, "clearml_downloads", args.clearml_load_task_id)
-                    os.makedirs(clearml_download_parent_dir, exist_ok=True)
-                    downloaded_path = artifact.get_local_copy(extract_archive=True, destination_path=clearml_download_parent_dir)
-                    
-                    potential_ckpt_dir = downloaded_path
-                    if os.path.basename(downloaded_path) == artifact_to_load_name:
-                        sub_items = os.listdir(downloaded_path)
-                        ckpt_dirs_inside = [d for d in sub_items if os.path.isdir(os.path.join(downloaded_path, d)) and d.startswith("checkpoints-")]
-                        if len(ckpt_dirs_inside) == 1:
-                            potential_ckpt_dir = os.path.join(downloaded_path, ckpt_dirs_inside[0])
-                            logger.info(f"Found checkpoint directory '{ckpt_dirs_inside[0]}' inside downloaded artifact '{artifact_to_load_name}'.")
+                    logger.info(f"Attempting to download and extract artifact {artifact.name} to ClearML's default cache.")
+                    downloaded_path = artifact.get_local_copy(extract_archive=True) # Removed destination_path
 
-                    dir_name = os.path.basename(potential_ckpt_dir)
-                    match = re.match(r"checkpoints-(\d+)", dir_name)
-                    if match and os.path.isdir(potential_ckpt_dir):
-                        latest_ckpt_dir = potential_ckpt_dir
-                        latest_step = int(match.group(1))
-                        resume_from_ckpt = True
-                        logger.info(f"Successfully downloaded and identified checkpoint '{dir_name}' from ClearML. Path: {latest_ckpt_dir}. Resuming from step {latest_step}.")
+                    if not downloaded_path:
+                        logger.error(f"Failed to get local copy of artifact {artifact.name}. Path returned was None.")
+                        # This will cause resume_from_ckpt to remain False, and it will try local checkpoints.
                     else:
-                        logger.warning(f"Could not parse step from ClearML checkpoint directory name: '{dir_name}' or it's not a directory. Path: {potential_ckpt_dir}. Will not resume from this ClearML checkpoint.")
+                        logger.info(f"Artifact {artifact.name} made available at: {downloaded_path}")
+                        # downloaded_path is the path to the extracted directory, e.g., /path/to/clearml_downloads/task_id/lora-adapter/
+                        # If the artifact itself is the checkpoint directory (e.g. "checkpoints-1100")
+                        dir_name = os.path.basename(downloaded_path)
+                        match = re.match(r"checkpoints-(\d+)", dir_name)
+                        if match and os.path.isdir(downloaded_path):
+                            latest_ckpt_dir = downloaded_path
+                            latest_step = int(match.group(1))
+                            resume_from_ckpt = True
+                            logger.info(f"Successfully downloaded and identified checkpoint '{dir_name}' from ClearML. Path: {latest_ckpt_dir}. Resuming from step {latest_step}.")
+                        else:
+                            logger.warning(f"Could not parse step from ClearML checkpoint directory name: '{dir_name}' or it's not a directory. Path: {downloaded_path}. Will not resume from this ClearML checkpoint.")
                 else:
                     logger.warning(f"Artifact '{artifact_to_load_name}' not found in ClearML task {args.clearml_load_task_id}. Available artifacts: {list(source_task.artifacts.keys())}")
             except Exception as e:
