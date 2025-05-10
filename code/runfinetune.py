@@ -64,7 +64,7 @@ def get_loader(data_file, args, tokenizer, pool, eval = False):
 
 
 ### eval function compares predictions with gold references(ground truth)
-def eval_bleu_epoch(args, eval_dataloader, model, tokenizer, valid_file):  # Added valid_file argument
+def eval_bleu_epoch(args, eval_dataloader, model, tokenizer, valid_file, current_global_step):  # Added valid_file argument and current_global_step
     logger.info(f"  ***** Running bleu evaluation on {valid_file} *****")
     logger.info("  Batch size = %d", args.eval_batch_size)
     # Create output directory if it doesn't exist
@@ -116,7 +116,7 @@ def eval_bleu_epoch(args, eval_dataloader, model, tokenizer, valid_file):  # Add
         task = Task.current_task()
         if task:
             # Add safety check for global_step
-            iteration = getattr(args, 'global_step', 0)
+            iteration = current_global_step # Use the passed global_step
             task.logger.report_scalar("evaluation", "BLEU", value=bleu, iteration=iteration)
             task.logger.report_scalar("evaluation", "Exact Match", value=em, iteration=iteration)
             
@@ -266,8 +266,6 @@ def main(args):
         try:
             from clearml import Task
             task = Task.init(project_name="AI Powered CodeReviewer", task_name="Distributed Training")
-            # Log configuration parameters
-            task.connect_configuration(vars(args))
             logger.info("ClearML initialized successfully on main process")
         except Exception as e:
             logger.warning(f"ClearML could not be initialized: {str(e)}")
@@ -433,26 +431,139 @@ def main(args):
 
     data_tuple = get_loader(valid_file, args, tokenizer, pool, eval=True)
     _, _, valid_dataloader = data_tuple
-     # Check for latest checkpoint
-    latest_ckpt_dir, latest_step = find_latest_checkpoint(args.output_dir)
+
+    # --- Checkpoint Loading Logic ---
+    latest_ckpt_dir = None
+    latest_step = 0
     resume_from_ckpt = False
-    if latest_ckpt_dir:
+
+    # Try loading checkpoint from ClearML if specified
+    if hasattr(args, 'clearml_load_task_id') and args.clearml_load_task_id:
+        if args.global_rank == 0: # Only rank 0 downloads the checkpoint
+            logger.info(f"Attempting to load checkpoint from ClearML task ID: {args.clearml_load_task_id}, artifact: {args.clearml_load_artifact_name}")
+            try:
+                source_task = Task.get_task(task_id=args.clearml_load_task_id)
+                artifact_to_load_name = args.clearml_load_artifact_name
+                
+                if artifact_to_load_name in source_task.artifacts:
+                    artifact = source_task.artifacts[artifact_to_load_name]
+                    logger.info(f"Downloading artifact: {artifact.name} (URL: {artifact.url}) from task {args.clearml_load_task_id}")
+                    
+                    clearml_download_parent_dir = os.path.join(args.output_dir, "clearml_downloads", args.clearml_load_task_id)
+                    os.makedirs(clearml_download_parent_dir, exist_ok=True)
+                    downloaded_path = artifact.get_local_copy(extract_archive=True, destination_path=clearml_download_parent_dir)
+                    
+                    potential_ckpt_dir = downloaded_path
+                    if os.path.basename(downloaded_path) == artifact_to_load_name:
+                        sub_items = os.listdir(downloaded_path)
+                        ckpt_dirs_inside = [d for d in sub_items if os.path.isdir(os.path.join(downloaded_path, d)) and d.startswith("checkpoints-")]
+                        if len(ckpt_dirs_inside) == 1:
+                            potential_ckpt_dir = os.path.join(downloaded_path, ckpt_dirs_inside[0])
+                            logger.info(f"Found checkpoint directory '{ckpt_dirs_inside[0]}' inside downloaded artifact '{artifact_to_load_name}'.")
+
+                    dir_name = os.path.basename(potential_ckpt_dir)
+                    match = re.match(r"checkpoints-(\d+)", dir_name)
+                    if match and os.path.isdir(potential_ckpt_dir):
+                        latest_ckpt_dir = potential_ckpt_dir
+                        latest_step = int(match.group(1))
+                        resume_from_ckpt = True
+                        logger.info(f"Successfully downloaded and identified checkpoint '{dir_name}' from ClearML. Path: {latest_ckpt_dir}. Resuming from step {latest_step}.")
+                    else:
+                        logger.warning(f"Could not parse step from ClearML checkpoint directory name: '{dir_name}' or it's not a directory. Path: {potential_ckpt_dir}. Will not resume from this ClearML checkpoint.")
+                else:
+                    logger.warning(f"Artifact '{artifact_to_load_name}' not found in ClearML task {args.clearml_load_task_id}. Available artifacts: {list(source_task.artifacts.keys())}")
+            except Exception as e:
+                logger.error(f"Failed to load checkpoint from ClearML: {e}", exc_info=True)
+        
+        dist.barrier()
+        if args.world_size > 1:
+            broadcast_resume_info = [latest_ckpt_dir, latest_step, resume_from_ckpt]
+            dist.broadcast_object_list(broadcast_resume_info, src=0)
+            latest_ckpt_dir, latest_step, resume_from_ckpt = broadcast_resume_info
+            if resume_from_ckpt:
+                 logger.info(f"[Rank {args.global_rank}] Received ClearML checkpoint info: dir='{latest_ckpt_dir}', step={latest_step}")
+
+
+    if not resume_from_ckpt:
+        if args.global_rank == 0:
+            logger.info("Searching for local checkpoints in: {}".format(args.output_dir))
+        
+        local_latest_ckpt_dir, local_latest_step = find_latest_checkpoint(args.output_dir)
+        
+        if args.global_rank == 0 and local_latest_ckpt_dir:
+            logger.info(f"Found local checkpoint: {local_latest_ckpt_dir} at step {local_latest_step}")
+            latest_ckpt_dir = local_latest_ckpt_dir
+            latest_step = local_latest_step
+            resume_from_ckpt = True
+        elif args.global_rank == 0:
+            logger.info("No suitable local checkpoint found.")
+
+        dist.barrier()
+        if args.world_size > 1 and not resume_from_ckpt:
+            broadcast_resume_info = [latest_ckpt_dir, latest_step, resume_from_ckpt]
+            if args.global_rank == 0:
+                 dist.broadcast_object_list(broadcast_resume_info, src=0)
+            else:
+                 dist.broadcast_object_list(broadcast_resume_info, src=0)
+                 latest_ckpt_dir, latest_step, resume_from_ckpt = broadcast_resume_info
+            if resume_from_ckpt:
+                 logger.info(f"[Rank {args.global_rank}] Received local checkpoint info: dir='{latest_ckpt_dir}', step={latest_step}")
+
+
+    global_step = latest_step if resume_from_ckpt else 0
+    
+    if task and args.global_rank == 0:
+        task.connect_configuration(vars(args))
+        if resume_from_ckpt:
+            task.logger.report_text(f"Resuming from checkpoint: {latest_ckpt_dir}, step {latest_step}")
+            task.logger.report_scalar("training", "resumed_from_step", value=latest_step, iteration=0)
+
+    if resume_from_ckpt:
+        logger.info(f"[Rank {args.global_rank}] Attempting to load states from checkpoint directory: {latest_ckpt_dir}")
         model_ckpt = os.path.join(latest_ckpt_dir, "pytorch_model.bin")
         optimizer_ckpt = os.path.join(latest_ckpt_dir, "optimizer.pt")
         scheduler_ckpt = os.path.join(latest_ckpt_dir, "scheduler.pt")
-        if os.path.exists(model_ckpt):
-            logger.info(f"Resuming model from checkpoint: {latest_ckpt_dir}")
-            state_dict = torch.load(model_ckpt, map_location="cpu")
-            model.module.load_state_dict(state_dict, strict=False)
-            resume_from_ckpt = True
-        if os.path.exists(optimizer_ckpt):
-            optimizer.load_state_dict(torch.load(optimizer_ckpt, map_location="cpu"))
-        if os.path.exists(scheduler_ckpt):
-            scheduler.load_state_dict(torch.load(scheduler_ckpt, map_location="cpu"))
 
-    global_step = latest_step if resume_from_ckpt else 0
-    if resume_from_ckpt:
+        if os.path.exists(model_ckpt):
+            logger.info(f"[Rank {args.global_rank}] Loading model from {model_ckpt}")
+            state_dict = torch.load(model_ckpt, map_location=lambda storage, loc: storage.cuda(args.local_rank) if torch.cuda.is_available() else storage)
+            
+            if hasattr(model, "module") and hasattr(model.module, "load_state_dict"):
+                 try:
+                    model.module.load_state_dict(state_dict, strict=False)
+                 except RuntimeError as e:
+                    logger.warning(f"[Rank {args.global_rank}] Failed to load model state_dict with strict=False, trying to load into base_model: {e}")
+                    if hasattr(model.module, 'base_model'):
+                         model.module.base_model.load_state_dict(state_dict, strict=False)
+                    else:
+                         raise e
+            else:
+                 model.load_state_dict(state_dict, strict=False)
+            logger.info(f"[Rank {args.global_rank}] Model loaded successfully.")
+        else:
+            logger.warning(f"[Rank {args.global_rank}] Model checkpoint file not found: {model_ckpt}")
+
+
+        if os.path.exists(optimizer_ckpt):
+            logger.info(f"[Rank {args.global_rank}] Loading optimizer from {optimizer_ckpt}")
+            optimizer.load_state_dict(torch.load(optimizer_ckpt, map_location=lambda storage, loc: storage.cuda(args.local_rank) if torch.cuda.is_available() else storage))
+            logger.info(f"[Rank {args.global_rank}] Optimizer loaded successfully.")
+        else:
+            logger.warning(f"[Rank {args.global_rank}] Optimizer checkpoint file not found: {optimizer_ckpt}")
+
+        if os.path.exists(scheduler_ckpt):
+            logger.info(f"[Rank {args.global_rank}] Loading scheduler from {scheduler_ckpt}")
+            scheduler.load_state_dict(torch.load(scheduler_ckpt, map_location=lambda storage, loc: storage.cuda(args.local_rank) if torch.cuda.is_available() else storage))
+            logger.info(f"[Rank {args.global_rank}] Scheduler loaded successfully.")
+        else:
+            logger.warning(f"[Rank {args.global_rank}] Scheduler checkpoint file not found: {scheduler_ckpt}")
+        
         logger.info(f"[Rank {args.global_rank}] Training will resume from step {global_step}")
+        dist.barrier()
+    else:
+        logger.info(f"[Rank {args.global_rank}] No checkpoint found or specified. Starting training from scratch.")
+        global_step = 0
+
 
     for epoch in range(1, args.train_epochs + 1):
         # set seed for reproducible data split
@@ -547,7 +658,7 @@ def main(args):
                     # end training
                     output_dir = os.path.join(args.output_dir, "checkpoints-last")
                     save_model(model, optimizer, scheduler, output_dir, config)
-                    bleu = eval_bleu_epoch(args, valid_dataloader, model, tokenizer, valid_file)
+                    bleu = eval_bleu_epoch(args, valid_dataloader, model, tokenizer, valid_file, global_step) # Pass global_step
                     save_model(model, optimizer, scheduler, output_dir, config)
                     logger.info(f"Reach max steps {args.train_steps}.")
                     time.sleep(5)
@@ -565,7 +676,7 @@ def main(args):
                 logger.info(f"[Rank {args.global_rank}] Starting checkpoint evaluation at step {global_step}")
                 output_dir = os.path.join(args.output_dir, "checkpoints-" + str(global_step))
                 save_model(model, optimizer, scheduler, output_dir, config)
-                bleu = eval_bleu_epoch(args, valid_dataloader, model, tokenizer, valid_file)
+                bleu = eval_bleu_epoch(args, valid_dataloader, model, tokenizer, valid_file, global_step) # Pass global_step
                 logger.info(
                     f"[Rank {args.global_rank}] Checkpoint saved: {global_step}-step model and optimizer into {output_dir}"
                 )

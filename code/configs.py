@@ -213,6 +213,18 @@ def add_args(parser):
         default=None,
         help="ClearML Dataset ID to fetch validation data from. Overrides dev_filename if provided.",
     )
+    parser.add_argument(
+        "--clearml_load_task_id",
+        type=str,
+        default=None,
+        help="ClearML Task ID to load checkpoint from."
+    )
+    parser.add_argument(
+        "--clearml_load_artifact_name",
+        type=str,
+        default="lora-adapter",
+        help="Name of the ClearML artifact to load (e.g., 'lora-adapter' or 'checkpoints-1100')."
+    )
     args = parser.parse_args()
     return args
 
